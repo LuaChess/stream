@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Twitch Follow Alert</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: transparent !important; /* transparent for OBS */
+    overflow: hidden;
+    font-family: "Segoe UI", "Inter", system-ui, -apple-system, Arial, sans-serif;
+  }
+  body.preview { background: #18181b !important; }
+
+  #stage {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .alert {
+    display: none;
+    flex-direction: column; align-items: center; gap: 10px;
+    text-align: center;
+    opacity: 0; transform: scale(.85);
+    transition: opacity .4s ease, transform .4s ease;
+  }
+  .alert.show { display: flex; }
+  .alert.in { opacity: 1; transform: scale(1); }
+  .alert img {
+    max-width: 100%; max-height: 70vh; object-fit: contain;
+  }
+  .text {
+    color: #fff; font-weight: 800; font-size: 44px; line-height: 1.15;
+    text-shadow: 0 0 6px #000, 0 0 6px #000, 2px 2px 4px #000, -2px -2px 4px #000;
+    word-break: break-word; padding: 0 16px;
+  }
+  .text .name { color: #bf94ff; }
+  .text .sub { display: block; font-size: .55em; font-weight: 600; color: #fff; }
+
+  #status {
+    position: fixed; top: 6px; left: 8px; right: 8px; font-size: 13px; color: #ffb4b4;
+    font-family: system-ui, sans-serif; display: none; white-space: pre-wrap;
+  }
+  #help {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: #efeff1;
+  }
+  #help .card {
+    background: #1f1f23; border: 1px solid #3a3a3d; border-radius: 12px;
+    padding: 22px 26px; width: min(640px, 92vw); box-sizing: border-box; font-size: 14px; line-height: 1.55;
+  }
+  #help h1 { margin: 0 0 10px; font-size: 19px; }
+  #help code { background: #0e0e10; padding: 2px 6px; border-radius: 4px; word-break: break-all; }
+</style>
+</head>
+<body>
+<div id="status"></div>
+<div id="stage">
+  <div class="alert" id="alert">
+    <img id="gif" alt="">
+    <div class="text" id="text"></div>
+  </div>
+</div>
+
+<div id="help">
+  <div class="card">
+    <h1>Follow Alert – setup needed</h1>
+    <p>Twitch only gives follow events to logged-in apps, so this overlay needs a <b>Client ID</b> and a <b>user token</b> from you (one-time setup):</p>
+    <ol>
+      <li>Go to <code>dev.twitch.tv/console</code> → <b>Register Your Application</b>. Redirect URL: <code>http://localhost</code>. Category: Other. Copy the <b>Client ID</b>.</li>
+      <li>Open this link in your browser (replace <code>YOUR_CLIENT_ID</code>), logged in as the channel owner:<br>
+        <code>https://id.twitch.tv/oauth2/authorize?client_id=YOUR_CLIENT_ID&amp;redirect_uri=http://localhost&amp;response_type=token&amp;scope=moderator:read:followers</code></li>
+      <li>Click <b>Authorize</b>. The page fails to load – that's fine. Copy the value after <code>access_token=</code> from the address bar (up to the next <code>&amp;</code>).</li>
+      <li>Use it either in the URL: <code>twitch-follow-alert.html?clientId=…&amp;token=…</code><br>
+          or put both into <code>CLIENT_ID</code> / <code>TOKEN</code> at the top of the script (best for "Local file" in OBS).</li>
+    </ol>
+    <p>Add <code>?test=1</code> (or press <b>T</b>) to preview an alert without a real follow.<br>
+       <b>Keep your token private</b> – don't show the OBS source properties on stream.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ===== SETTINGS =====
+  const CLIENT_ID = "";   // your Twitch app Client ID
+  const TOKEN = "";       // user access token (scope: moderator:read:followers)
+  const DEFAULT_GIF = "https://cdn.discordapp.com/attachments/1251607382036054026/1565803087585746974/lv_0_20261030220156.gif";
+
+  // URL options (all optional):
+  //   ?clientId=...  ?token=...
+  //   &channel=name   channel to watch (default: the owner of the token)
+  //   &gif=URL        custom gif/image (default: the gif above)
+  //   &duration=6     seconds each alert stays on screen
+  //   &text=...       message under the gif; {name} is replaced (default: "{name} just followed!")
+  //   &size=44        text size in px
+  //   &test=1         shows a test alert on load
+  const params = new URLSearchParams(location.search);
+  const clientId = params.get("clientId") || CLIENT_ID;
+  const token = (params.get("token") || TOKEN).replace(/^oauth:/i, "");
+  const channelParam = (params.get("channel") || "").trim().replace(/^#/, "").toLowerCase();
+  const GIF = params.get("gif") || DEFAULT_GIF;
+  const DURATION = Math.max(2, parseFloat(params.get("duration") || "6"));
+  const TEXT = params.get("text") || "{name} just followed!";
+  const SIZE = parseInt(params.get("size") || "44", 10);
+  const TEST = params.get("test") === "1";
+
+  const isOBS = typeof window.obsstudio !== "undefined";
+  if (!isOBS) document.body.classList.add("preview");
+
+  const alertEl = document.getElementById("alert");
+  const gifEl = document.getElementById("gif");
+  const textEl = document.getElementById("text");
+  const statusEl = document.getElementById("status");
+  textEl.style.fontSize = SIZE + "px";
+  gifEl.src = GIF;
+
+  function setStatus(msg) {
+    if (isOBS) return; // never show errors inside OBS
+    statusEl.style.display = msg ? "block" : "none";
+    statusEl.textContent = msg || "";
+  }
+
+  // ===== Alert queue =====
+  const queue = [];
+  let showing = false;
+  const seen = new Set();
+
+  function enqueue(name) { queue.push(name); next(); }
+
+  function renderText(name) {
+    textEl.textContent = "";
+    const parts = TEXT.split("{name}");
+    parts.forEach((p, i) => {
+      textEl.appendChild(document.createTextNode(p));
+      if (i < parts.length - 1) {
+        const s = document.createElement("span");
+        s.className = "name";
+        s.textContent = name;
+        textEl.appendChild(s);
+      }
+    });
+  }
+
+  function next() {
+    if (showing || !queue.length) return;
+    showing = true;
+    const name = queue.shift();
+    renderText(name);
+    // restart the gif from the first frame
+    gifEl.src = "";
+    gifEl.src = GIF;
+    alertEl.classList.add("show");
+    requestAnimationFrame(() => requestAnimationFrame(() => alertEl.classList.add("in")));
+    setTimeout(() => {
+      alertEl.classList.remove("in");
+      setTimeout(() => {
+        alertEl.classList.remove("show");
+        showing = false;
+        next();
+      }, 450);
+    }, DURATION * 1000);
+  }
+
+  // Test alerts: ?test=1 or press T
+  window.addEventListener("keydown", e => { if (e.key.toLowerCase() === "t") enqueue("TestFollower"); });
+  if (TEST) setTimeout(() => enqueue("TestFollower"), 800);
+
+  // ===== Setup check =====
+  if (!clientId || !token) {
+    if (!TEST) {
+      document.body.classList.add("preview");
+      document.getElementById("help").style.display = "flex";
+    }
+    return;
+  }
+
+  // ===== Twitch API + EventSub =====
+  const headers = { "Client-Id": clientId, "Authorization": "Bearer " + token };
+  let broadcasterId = null, moderatorId = null;
+
+  async function api(path, opts = {}) {
+    const r = await fetch("https://api.twitch.tv/helix" + path, { ...opts, headers: { ...headers, ...(opts.headers || {}) } });
+    if (!r.ok) {
+      let detail = "";
+      try { detail = (await r.json()).message || ""; } catch (_) {}
+      throw new Error(`Twitch API ${r.status}: ${detail}`);
+    }
+    return r.json();
+  }
+
+  async function init() {
+    try {
+      const me = (await api("/users")).data[0];
+      moderatorId = me.id;
+      if (channelParam && channelParam !== me.login.toLowerCase()) {
+        const u = (await api("/users?login=" + encodeURIComponent(channelParam))).data[0];
+        if (!u) throw new Error("Channel not found: " + channelParam);
+        broadcasterId = u.id;
+      } else {
+        broadcasterId = me.id;
+      }
+      connect("wss://eventsub.wss.twitch.tv/ws");
+    } catch (e) {
+      setStatus(e.message + "\n(Token invalid/expired? Create a new one – see setup steps.)");
+    }
+  }
+
+  let ws;
+  function connect(url) {
+    const sock = new WebSocket(url);
+    ws = sock;
+    let keepaliveTimer = null;
+    const armKeepalive = (sec) => {
+      clearTimeout(keepaliveTimer);
+      keepaliveTimer = setTimeout(() => sock.close(), (sec + 10) * 1000);
+    };
+
+    sock.onmessage = async (ev) => {
+      const msg = JSON.parse(ev.data);
+      const type = msg.metadata && msg.metadata.message_type;
+      if (type === "session_welcome") {
+        armKeepalive(msg.payload.session.keepalive_timeout_seconds || 10);
+        // when reconnecting via reconnect_url the subscriptions carry over
+        if (url === "wss://eventsub.wss.twitch.tv/ws") {
+          try {
+            await api("/eventsub/subscriptions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                type: "channel.follow",
+                version: "2",
+                condition: { broadcaster_user_id: broadcasterId, moderator_user_id: moderatorId },
+                transport: { method: "websocket", session_id: msg.payload.session.id }
+              })
+            });
+            setStatus("");
+          } catch (e) {
+            setStatus(e.message + "\n(You must be the broadcaster or a mod of the channel, with scope moderator:read:followers.)");
+          }
+        }
+      } else if (type === "session_keepalive") {
+        armKeepalive(10);
+      } else if (type === "notification") {
+        armKeepalive(10);
+        const id = msg.metadata.message_id;
+        if (seen.has(id)) return;
+        seen.add(id);
+        if (msg.metadata.subscription_type === "channel.follow") {
+          const e = msg.payload.event;
+          enqueue(e.user_name || e.user_login);
+        }
+      } else if (type === "session_reconnect") {
+        connect(msg.payload.session.reconnect_url);
+      }
+    };
+    sock.onclose = () => {
+      clearTimeout(keepaliveTimer);
+      if (ws === sock) setTimeout(() => connect("wss://eventsub.wss.twitch.tv/ws"), 3000);
+    };
+    sock.onerror = () => sock.close();
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
